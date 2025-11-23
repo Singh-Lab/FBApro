@@ -1,0 +1,1 @@
+Place data here: model files, sbml format. We used e_coli_core, iND750, iMM1415 and RECON1 from BiGG.

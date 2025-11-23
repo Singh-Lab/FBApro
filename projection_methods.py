@@ -302,7 +302,7 @@ class FbaProjectionLowMidConfidence(nn.Module):
 
         # See overleaf writeup, final projection is A pinv(PA) P
         # pinv_PA_P = torch.linalg.lstsq(PA, P, rcond=rcond, driver=driver).solution
-        pinv_PA_P = torch.linalg.pinv(PA, rtol=rcond) @ P
+        pinv_PA_P = torch.linalg.pinv(PA, rcond=rcond) @ P
         projection_matrix = torch.matmul(self.A, pinv_PA_P)
         # projection_matrix = torch.matmul(self.A, torch.matmul(torch.linalg.pinv(PA), P))
 
