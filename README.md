@@ -21,4 +21,11 @@ projection = FBAprojection(model)
 
 steadied_states = projection.forward(data) 
 
-## See "example" for toy models and a notebook of running FBApro variants on them.
+# See "example" for toy models and a notebook with examples of running FBApro variants on different inputs on these models.
+
+# Real and simulated data reproduction
+## Synthetic data
+synthetic_exact_noisy_data.ipynb, synthetic_noisy_missing_data.ipynb, synthetic_projections_timing.ipynb generate synthetic steady-state fluxes from given metabolic models, and analyze the runtime and performance of FBApro variants and benchmarks on them. To recreate paper figures, models need to be sourced and placed in synthetic_data_experiment_files/data (see instructions there).
+
+## Real data
+real_data_run.ipynb runs FBApro variants and benchmark on a given model, GE data and flux data and outputs predictions. real_data_plot.ipynb reads predictions and cached processed data and plots performance of methods. To recreate paper figures, data need to be sourced and placed in real_data_experiment_files/data (see instructions there).
