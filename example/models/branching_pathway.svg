@@ -7,16 +7,16 @@
    xmlns="http://www.w3.org/2000/svg"
    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
    xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
-   width="265.10733mm"
+   width="215.8484mm"
    height="196.70522mm"
-   viewBox="0 0 265.10733 196.70521"
+   viewBox="0 0 215.8484 196.70522"
    version="1.1"
    id="svg1871"
    inkscape:version="1.0.1 (3bc2e813f5, 2020-09-07)"
    sodipodi:docname="branching_pathway.svg"
    inkscape:export-filename="C:\Users\Ariel\PycharmProjects\FBApro\example\models\branching_pathway.png"
-   inkscape:export-xdpi="40.029442"
-   inkscape:export-ydpi="40.029442">
+   inkscape:export-xdpi="49.97224"
+   inkscape:export-ydpi="49.97224">
   <defs
      id="defs1865">
     <marker
@@ -153,11 +153,11 @@
      borderopacity="1.0"
      inkscape:pageopacity="0.0"
      inkscape:pageshadow="2"
-     inkscape:zoom="0.28379658"
-     inkscape:cx="543.45064"
-     inkscape:cy="318.51894"
+     inkscape:zoom="0.56759317"
+     inkscape:cx="258.96668"
+     inkscape:cy="488.19684"
      inkscape:document-units="mm"
-     inkscape:current-layer="layer1"
+     inkscape:current-layer="g2469-0"
      inkscape:document-rotation="0"
      showgrid="false"
      fit-margin-top="0"
@@ -177,7 +177,7 @@
         <dc:format>image/svg+xml</dc:format>
         <dc:type
            rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
-        <dc:title></dc:title>
+        <dc:title />
       </cc:Work>
     </rdf:RDF>
   </metadata>
@@ -185,7 +185,7 @@
      inkscape:label="Layer 1"
      inkscape:groupmode="layer"
      id="layer1"
-     transform="translate(2.2957167,-25.233887)">
+     transform="translate(-23.104283,-25.233887)">
     <g
        id="g2464"
        transform="translate(0.90912135,5.3737117)">
@@ -221,7 +221,7 @@
          id="tspan3045"
          x="139.28328"
          y="41.142136"
-         style="stroke-width:0.264583">import_A (r1)</tspan></text>
+         style="stroke-width:0.264583">import_A</tspan></text>
     <g
        id="g2469"
        transform="translate(30.536642,33.004392)">
@@ -257,7 +257,7 @@
          id="tspan3045-7"
          x="161.75159"
          y="123.31042"
-         style="stroke-width:0.264583">A_to_Right (r2)</tspan></text>
+         style="stroke-width:0.264583">A_to_Right</tspan></text>
     <text
        xml:space="preserve"
        style="font-style:normal;font-weight:normal;font-size:10.5833px;line-height:1.25;font-family:sans-serif;fill:#000000;fill-opacity:1;stroke:none;stroke-width:0.264583"
@@ -268,7 +268,7 @@
          id="tspan3045-7-8"
          x="170.44547"
          y="204.92575"
-         style="stroke-width:0.264583">export_Right (r3)</tspan></text>
+         style="stroke-width:0.264583">export_Right</tspan></text>
     <g
        id="g2469-0"
        transform="translate(-30.584955,33.004384)">
@@ -301,25 +301,25 @@
     <text
        xml:space="preserve"
        style="font-style:normal;font-weight:normal;font-size:10.5833px;line-height:1.25;font-family:sans-serif;fill:#000000;fill-opacity:1;stroke:none;stroke-width:0.264583"
-       x="15.979108"
+       x="37.674961"
        y="123.31042"
        id="text3047-3-3"><tspan
          sodipodi:role="line"
          id="tspan3045-7-9"
-         x="15.979108"
+         x="37.674961"
          y="123.31042"
-         style="stroke-width:0.264583">A_to_Left (r4)</tspan></text>
+         style="stroke-width:0.264583">A_to_Left</tspan></text>
     <text
        xml:space="preserve"
        style="font-style:normal;font-weight:normal;font-size:10.5833px;line-height:1.25;font-family:sans-serif;fill:#000000;fill-opacity:1;stroke:none;stroke-width:0.264583"
-       x="-2.8434851"
+       x="22.556515"
        y="204.92574"
        id="text3047-3-5-7"><tspan
          sodipodi:role="line"
          id="tspan3045-7-8-1"
-         x="-2.8434851"
+         x="22.556515"
          y="204.92574"
-         style="stroke-width:0.264583">export_Left (r5)</tspan></text>
+         style="stroke-width:0.264583">export_Left</tspan></text>
     <path
        style="fill:none;stroke:#000000;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1;marker-end:url(#TriangleOutL-2-0-1)"
        d="m 131.3976,107.19972 13.63687,23.61966"
