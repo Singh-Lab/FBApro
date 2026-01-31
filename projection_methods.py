@@ -8,72 +8,9 @@ import pandas as pd
 import cobra
 
 
-class FbaProjection(nn.Module):
-    def __init__(self, stoichiometric_matrix,
-                 device=torch.device('cuda'), dtype=torch.float, rcond=1e-5, driver=None,
-                 **kwargs):
-        super().__init__()
-        if driver is None:
-            if device.type == 'cuda':
-                # print("Warning: on CUDA can only use gels driver, which assumes matrices are full-rank")
-                driver = 'gels'
-            else:
-                driver = 'gelsd'
 
-        A = stoichiometric_matrix
-        if type(A) != torch.Tensor:
-            A = torch.tensor(A, dtype=dtype, device=device)
-        else:
-            A = A.to(device).to(dtype)
-        I = torch.eye(A.shape[1], dtype=dtype, device=device)
-        # self.register_buffer('I', I, persistent=True)
-        # self.register_buffer('projection_matrix',
-        #                      I - torch.linalg.lstsq(A, A, rcond=rcond, driver=driver).solution, persistent=True)
-        # self.register_buffer('projection_matrix',
-        #                      I - torch.linalg.pinv(A, rcond=rcond) @ A, persistent=True)
-        kernel_orthonormal_basis = torch.from_numpy(scipy.linalg.null_space(A.cpu().numpy())).to(device=device,
-                                                                                                 dtype=torch.float)
-        self.register_buffer('projection_matrix',
-                             kernel_orthonormal_basis @ torch.transpose(kernel_orthonormal_basis, 0, 1),
-                             persistent=True)
-        # print("Projection matrix size: {}, A size: {}".format(self.projection_matrix.shape, A.shape))
-
-    def forward(self, x, l_bounds=None, u_bounds=None):
-
-        # if not isinstance(x, torch.Tensor):
-        #     x = torch.tensor(x, dtype=torch.float)
-        nan_frac = x.cpu().isnan().float().mean().mean()
-        if nan_frac > 0:
-            print("(FbaPro) nan frac in x:{:.2f}".format(nan_frac))
-            if nan_frac == 1:
-                raise ValueError("All nans in x")
-            print("Converting nans to zeros")
-            x = x.nan_to_num(0.0)
-
-        # print(x.shape, self.kernel.shape)
-        assert x.device == self.projection_matrix.device
-        res = torch.matmul(x, torch.transpose(self.projection_matrix, 0, 1))  # note that x is samples X reactions
-
-        nan_frac = res.cpu().isnan().float().mean().mean()
-        if nan_frac > 0:
-            print("(FbaPro) nan frac in res:{:.2f}".format(nan_frac))
-            if nan_frac == 1:
-                raise ValueError("All nans in res")
-            print("Converting nans to zeros")
-            res = res.nan_to_num(0.0)
-
-        return res
-
-    def __repr__(self):
-        return "FBApro"
-
-    def __str__(self):
-        return self.__repr__()
-
-
-class FbaProjectionHighMidConfidence(nn.Module):
-    def __init__(self, stoichiometric_matrix, measured_indices=None, high_confidence_indices=None,
-                 # todo: at some point refactor everything to work with low-mid-high confidence indices.
+class FBApro(nn.Module):
+    def __init__(self, stoichiometric_matrix, measured_indices=None, unknown_indices=None,
                  steady_state_basis_matrix=None, acond=1e-5, device=torch.device('cuda'), rcond=1e-5, driver=None,
                  dtype=torch.float, **kwargs):
 
@@ -85,21 +22,29 @@ class FbaProjectionHighMidConfidence(nn.Module):
                 driver = 'gelsd'
 
         super().__init__()
-        # We're projecting to the intersection of ker(stoichiometric_matrix) and the space of vectors agreeing with
-        # initial_vector on the measured indices. First, express both as an affine space with a spanning basis.
+
+        self.have_warned_intersection = False
+        self.have_warned_projection = False
+
+        # The projection returns, for an input, a closest steady-state vector that agrees with it on measured_indices,
+        # where distances are computed only on indices not in unknown_indices.
+        # First, we express both the steady-state space (kernel of stoichiometric_matrix) and the measured_indices
+        # agreement space as affine spaces with spanning bases.
         # Note that the initial vector will only be known during forward pass, but measured indices will be known
         # beforehand, so that a lot can be precomputed.
+        # A mapping to the non-unmeasured indices is also computed. The full projection then consistes of first
+        # restriction-mapping to the not unknown-indices, a projection to the intersection of the two spaces there,
+        # and then an inverse map.
         # When computing some auxiliary matrices, acond is absolute conditioning, such that values with smaller
         # absolute values are zerod.
+        if measured_indices is None:
+            measured_indices = []
+        if unknown_indices is None:
+            unknown_indices = []
 
-        assert (measured_indices is not None) or (high_confidence_indices is not None) and not (
-                    measured_indices is not None and high_confidence_indices is not None)
-        if high_confidence_indices is None:
-            high_confidence_indices = measured_indices
+        # assert no intersection between measured and unknown indices
+        assert set(measured_indices).isdisjoint(set(unknown_indices))
 
-        if len(high_confidence_indices) == 0:
-            print("Warning: no measured indices given, method should be equivalent to FBAProjection but less eficient "
-                  "and more prone to numerical errors.")
 
         # steady-state as ker(A)
         if steady_state_basis_matrix is None:
@@ -114,10 +59,39 @@ class FbaProjectionHighMidConfidence(nn.Module):
                              persistent=True)
         self.register_buffer('A', steady_state_basis_matrix, persistent=True)
 
+        if len(measured_indices) == 0 and len(unknown_indices) == 0:
+            # Simply a projection to the steady-state space
+            self.register_buffer('projection_matrix',
+                                 self.A @ torch.linalg.pinv(self.A, rcond=rcond), persistent=True)
+            self.name = "FBAproBasic"
+            return
+
+        restriction_matrix = torch.zeros(stoichiometric_matrix.shape[1] - len(unknown_indices),
+                                         stoichiometric_matrix.shape[1],
+                                         dtype=dtype, device=device)
+        j = 0
+        for i in range(stoichiometric_matrix.shape[1] - len(unknown_indices)):
+            while j in unknown_indices:
+                j += 1
+            restriction_matrix[i, j] = 1
+            j += 1
+        P = restriction_matrix
+        self.register_buffer('P', restriction_matrix, persistent=True)
+
+        if len(measured_indices) == 0:
+            # This is only a steady-state projection ignoring some indices using a restriction.
+            PA = torch.matmul(self.P, self.A)
+            self.register_buffer('PA', PA, persistent=True)
+            pinv_PA_P = torch.linalg.pinv(PA, rcond=rcond) @ P
+            projection_matrix = torch.matmul(self.A, pinv_PA_P)
+            self.register_buffer('projection_matrix', projection_matrix, persistent=True)
+            self.name = "FBAproPartial"
+            return
+
         # agreement with any initial vector given later, v, as v + span(e_i for i not in measured_indices)
-        B = torch.zeros(self.A.shape[0], self.A.shape[0] - len(high_confidence_indices), dtype=dtype,
+        B = torch.zeros(self.A.shape[0], self.A.shape[0] - len(measured_indices), dtype=dtype,
                         device=device)
-        unmeasured_indices = [i for i in range(self.A.shape[0]) if i not in high_confidence_indices]
+        unmeasured_indices = [i for i in range(self.A.shape[0]) if i not in measured_indices]
         for i, j in enumerate(unmeasured_indices):
             B[j, i] = 1
         self.register_buffer('B', B, persistent=True)
@@ -126,7 +100,7 @@ class FbaProjectionHighMidConfidence(nn.Module):
         # BB^T is the dot products of rows of B. Each row can have at most 1 and the rest 0s, and two different rows
         # can't have 1 in the same index. BB^T is then a diagonal matrix with 1s at non-high confidence indices.
         BBT = torch.diag(
-            torch.tensor([int(i not in high_confidence_indices) for i in range(self.A.shape[0])], dtype=dtype,
+            torch.tensor([int(i not in measured_indices) for i in range(self.A.shape[0])], dtype=dtype,
                          device=device))
         # D = torch.matmul(self.A, torch.transpose(self.A, 1, 0)) + torch.matmul(self.B, torch.transpose(self.B, 1, 0))
         D = torch.matmul(self.A, torch.transpose(self.A, 1, 0)) + BBT
@@ -165,21 +139,40 @@ class FbaProjectionHighMidConfidence(nn.Module):
         # Cpinv = torch.linalg.pinv(self.C)
         # self.register_buffer('Cpinv', Cpinv, persistent=True)
 
-        # Now the final projection matrix is CCpinv(I - AAtDpinv) + AAtDpinv
         AAtDpinv = self.A @ torch.transpose(self.A, 0, 1) @ self.D_pseudoinv
-        # projection_matrix = (self.C @ torch.linalg.pinv(C, rtol=rcond) @ (torch.eye(
-        #     self.C.shape[0], dtype=dtype, device=device) - AAtDpinv)) + AAtDpinv
-        projection_matrix = self.C @ torch.linalg.lstsq(C, (torch.eye(
-            self.C.shape[0], dtype=dtype, device=device) - AAtDpinv), rcond=rcond, driver=driver).solution + AAtDpinv
-        self.register_buffer('projection_matrix', projection_matrix, persistent=True)
-
         self.register_buffer("AAtDpinv", AAtDpinv, persistent=True)
 
         DDpinv = torch.matmul(self.D, self.D_pseudoinv)
         self.register_buffer('DDpinv', DDpinv, persistent=True)
 
-        self.have_warned_intersection = False
-        self.have_warned_projection = False
+        if len(unknown_indices) == 0:
+            # this is only a steady-state projection with fixed values at measured indices
+            # Now the final projection matrix is CCpinv(I - AAtDpinv) + AAtDpinv
+            projection_matrix = self.C @ torch.linalg.lstsq(C, (torch.eye(
+                self.C.shape[0], dtype=dtype, device=device) - AAtDpinv), rcond=rcond,
+                                                            driver=driver).solution + AAtDpinv
+            self.register_buffer('projection_matrix', projection_matrix, persistent=True)
+            self.name = "FBAproFixed"
+            return
+
+        # The first projection - to the restricted intersection space
+        # v -> P(AA^TD^+ + PC(PC)^+[P - PAA^TD^+])v.
+        # Define T = PAA^TD^+ + PC(PC)^+[I - PAA^TD^+])
+        PAAtDpinv = self.P @ AAtDpinv
+        # print sizes of P, C, PAAtDpinv
+        print("P shape: {}, C shape: {}, PAAtDpinv shape: {}, A shape: {}, Dpinv shape: {}".format(self.P.shape, self.C.shape,
+                                                                     PAAtDpinv.shape, self.A.shape, self.D_pseudoinv.shape))
+        PCPCpinv_minus = self.P @ self.C @ torch.linalg.lstsq(
+            self.P @ self.C, self.P - PAAtDpinv, rcond=rcond, driver=driver).solution
+        self.register_buffer('T', PAAtDpinv + PCPCpinv_minus, persistent=True)
+
+        # We're now looking for x such that P(AA^TD^+v + Cx) = Tv
+        # Solving for this yields x = (PC)^+(y - PAA^TD^+v), and so finally the projection matrix is
+        # AA^TD^+ + C(PC)^+(T - PAA^TD^+)
+        projection_matrix = AAtDpinv + self.C @ torch.linalg.lstsq(
+            self.P @ self.C, self.T - PAAtDpinv, rcond=rcond, driver=driver).solution
+        self.register_buffer('projection_matrix', projection_matrix, persistent=True)
+        self.name = "FBAproFull"
 
     def forward(self, x, l_bounds=None, u_bounds=None):
         # x is samples X reactions, transpose for operations here
@@ -190,14 +183,14 @@ class FbaProjectionHighMidConfidence(nn.Module):
         x = x.to(self.stoic.device)
         nan_frac = x.isnan().float().mean().mean()
         if nan_frac > 0:
-            print("(FbaProHighMid) nan frac in x:{:.2f}".format(nan_frac))
+            print("(FbaPro) nan frac in x:{:.2f}".format(nan_frac))
             if nan_frac == 1:
                 raise ValueError("All nans in x")
             print("Converting nans to zeros")
             x = x.nan_to_num(0.0)
 
         # Check that intersection exists first (x = DDpinvx)
-        if not self.have_warned_intersection and not torch.allclose(x, self.DDpinv @ x):
+        if not self.have_warned_intersection and hasattr(self, 'DDpinv') and not torch.allclose(x, self.DDpinv @ x):
             print("Warning: Not sure that intersection exists")
             # print(x, "")
             # print absolute values, min, max, and mean
@@ -242,125 +235,13 @@ class FbaProjectionHighMidConfidence(nn.Module):
         return res
 
     def __repr__(self):
-        return "FBAproHighMid"
-
-    def __str__(self):
-        return self.__repr__()
-
-
-class FbaProjectionLowMidConfidence(nn.Module):
-    def __init__(self, stoichiometric_matrix, unknown_indices,
-                 steady_state_basis_matrix=None, rcond=1e-5, driver=None, device=torch.device('cuda'),
-                 dtype=torch.float, **kwargs):
-        super().__init__()
-        # Here we consider minimizing the distance of a steady-state vector to the input, but ignoring unknown indices.
-        # Given a basis to the steady-state space, this is equivalent to restricting both input and the basis
-        # to the measured indices, performing a projection there, and filling back the unknown indices.
-
-        if driver is None:
-            if device.type == 'cuda':
-                # print("Warning: on CUDA can only use gels driver, which assumes matrices are full-rank")
-                driver = 'gels'
-            else:
-                driver = 'gelsd'
-
-        if len(unknown_indices) == 0:
-            print(
-                "Warning: no unmeasured indices given, method should be equivalent to FBAProjection but less eficient "
-                "and more prone to numerical errors.")
-
-        # print("Unknown indices:", len(unknown_indices), "/", stoichiometric_matrix.shape[1])
-
-        # steady-state as span(A)
-        if steady_state_basis_matrix is None:
-            steady_state_basis_matrix = scipy.linalg.null_space(stoichiometric_matrix)
-        if type(steady_state_basis_matrix) != torch.Tensor:
-            steady_state_basis_matrix = torch.tensor(steady_state_basis_matrix, dtype=dtype,
-                                                     device=device)
+        if self is not None:
+            return self.name
         else:
-            steady_state_basis_matrix = steady_state_basis_matrix.to(device).to(dtype)
-        assert stoichiometric_matrix.shape[1] == steady_state_basis_matrix.shape[0]
-        self.register_buffer('stoic', torch.tensor(stoichiometric_matrix, device=device, dtype=dtype),
-                             persistent=True)
-        self.register_buffer('A', steady_state_basis_matrix, persistent=True)
-
-        restriction_matrix = torch.zeros(stoichiometric_matrix.shape[1] - len(unknown_indices),
-                                         stoichiometric_matrix.shape[1],
-                                         dtype=dtype, device=device)
-        j = 0
-        for i in range(stoichiometric_matrix.shape[1] - len(unknown_indices)):
-            while j in unknown_indices:
-                j += 1
-            restriction_matrix[i, j] = 1
-            j += 1
-        P = restriction_matrix
-        self.register_buffer('P', restriction_matrix, persistent=True)
-
-        # Project and save A
-        PA = torch.matmul(self.P, self.A)
-        self.register_buffer('PA', PA, persistent=True)
-
-        # See overleaf writeup, final projection is A pinv(PA) P
-        # pinv_PA_P = torch.linalg.lstsq(PA, P, rcond=rcond, driver=driver).solution
-        pinv_PA_P = torch.linalg.pinv(PA, rcond=rcond) @ P
-        projection_matrix = torch.matmul(self.A, pinv_PA_P)
-        # projection_matrix = torch.matmul(self.A, torch.matmul(torch.linalg.pinv(PA), P))
-
-        self.register_buffer('projection_matrix', projection_matrix, persistent=True)
-
-        self.have_warned = False
-
-    def forward(self, x, l_bounds=None, u_bounds=None):
-        # x is samples X reactions, transpose for operations here
-        x = torch.transpose(x, 0, 1)
-        # x here is b in the projection to (a+col(A)) \cap (b + col(B))
-        if type(x) != torch.Tensor:
-            x = torch.tensor(x, dtype=self.projection_matrix.dtype)
-        x = x.to(self.stoic.device).to(self.projection_matrix.dtype)
-        nan_frac = x.isnan().float().mean().mean()
-        if nan_frac > 0:
-            print("(FbaProLowMid) nan frac in x:{:.2f}".format(nan_frac))
-            if nan_frac == 1:
-                raise ValueError("All nans in x")
-            print("Converting nans to zeros")
-            x = x.nan_to_num(0.0)
-
-        res = self.projection_matrix @ x
-
-        if not self.have_warned and not torch.allclose(self.stoic @ res, torch.zeros((self.stoic.shape[0], 1),
-                                                                                     dtype=self.projection_matrix.dtype,
-                                                                                     device=self.stoic.device)):
-            print("Warning: projection failed to project to steady state. Accepting, but here are magnitudes:")
-            # print(res, "")
-            # print absolute values, min, max, and mean
-            print("output - abs min: {:.2e}, abs max: {:.2e}, abs mean: {:.2e}".format(res.abs().min(), res.abs().max(),
-                                                                                       res.abs().mean()))
-
-            mul = self.stoic @ res
-            # print(mul)
-            print("S * output - abs min: {:.2e}, abs max: {:.2e}, abs mean: {:.2e}".format(mul.abs().min(),
-                                                                                           mul.abs().max(),
-                                                                                           mul.abs().mean()))
-            print("Suppressing further warnings.")
-            self.have_warned = True
-        # transpose back
-        res = torch.transpose(res, 0, 1)
-        return res
-
-    def __repr__(self):
-        return "FBAproLowMid"
+            return "FBApro(uninitialized)"
 
     def __str__(self):
         return self.__repr__()
-
-
-class FbaProjectionLowMidHighConfidence(nn.Module):
-    def __init__(self, stoichiometric_matrix, measured_indices, unknown_indices,
-                 steady_state_basis_matrix=None, acond=1e-10, device=torch.device('cuda'), **kwargs):
-        super().__init__()
-        # The holy grail - minimize distance over some indices, require equality over others
-        # don't care about the rest.
-        raise NotImplementedError("Not implemented yet")
 
 class SoftClip(nn.Module):
     # see https://ccrma.stanford.edu/~jos/pasp/Soft_Clipping.html
@@ -530,27 +411,6 @@ class IterativeProjectionClip(nn.Module):
     def __str__(self):
         return self.__repr__()
 
-class ClipFbaProjection(IterativeProjectionClip):
-    def __init__(self, *args, **kwargs):
-        super().__init__(projection_class=FbaProjection, *args, **kwargs)
-
-    def __repr__(self):
-        return "FBAproClip"
-
-class ClipFbaProjectionLowMidConfidence(IterativeProjectionClip):
-    def __init__(self, *args, **kwargs):
-        super().__init__(projection_class=FbaProjectionLowMidConfidence, *args, **kwargs)
-
-    def __repr__(self):
-        return "FBAproLowMidClip"
-
-class ClipFbaProjectionHighMidConfidence(IterativeProjectionClip):
-    def __init__(self, *args, **kwargs):
-        super().__init__(projection_class=FbaProjectionHighMidConfidence, *args, **kwargs)
-
-    def __repr__(self):
-        return "FBAproHighMidClip"
-
 class IterativeProjectionScale(nn.Module):
     def __init__(self, projection_class, n_iters, l_bounds, u_bounds, dtype=torch.float, device=torch.device('cuda'),
                  zero_sign_mismatches=True, input_mix_fraction=0.8, *params, **kwargs):
@@ -576,26 +436,6 @@ class IterativeProjectionScale(nn.Module):
     def __str__(self):
         return self.__repr__()
 
-class ScaleFbaProjection(IterativeProjectionScale):
-    def __init__(self, *args, **kwargs):
-        super().__init__(projection_class=FbaProjection, *args, **kwargs)
-
-    def __repr__(self):
-        return "FBAproScale"
-
-class ScaleFbaProjectionLowMidConfidence(IterativeProjectionScale):
-    def __init__(self, *args, **kwargs):
-        super().__init__(projection_class=FbaProjectionLowMidConfidence, *args, **kwargs)
-
-    def __repr__(self):
-        return "FBAproLowMidScale"
-
-class ScaleFbaProjectionHighMidConfidence(IterativeProjectionScale):
-    def __init__(self, *args, **kwargs):
-        super().__init__(projection_class=FbaProjectionHighMidConfidence, *args, **kwargs)
-
-    def __repr__(self):
-        return "FBAproHighMidScale"
 
 class FBAWrapper(object):
     def __init__(self, model, dtype=torch.float, **kwargs):
