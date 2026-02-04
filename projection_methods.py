@@ -88,6 +88,39 @@ class FBApro(nn.Module):
             self.name = "FBAproPartial"
             return
 
+        if len(unknown_indices) == 0:
+            # There's a more efficient and probably stable implementation for this case, using the ker(S) representation
+            # Separate the indices to measured and otherwise, and separate the columns of S to these as
+            # S_H and S_nH. Then compute I-pinv(S_nH)S_nH and pinv(S_nH)S_Hm, first of size (|nH|,  |nH|) and
+            # second of size (|nH|, |H|). Then interlace their columns back to a matrix of size (|nH|, r). Then
+            # interlace the rows of this with row indicators for |H| (size (|H|, r)) to get the projection matrix.
+            S = stoichiometric_matrix
+            non_measured_indices = [i for i in range(self.S.shape[1]) if i not in measured_indices]
+            S_H = S[:, measured_indices]
+            S_nH = S[:, non_measured_indices]
+            # compute pinv(S_nH)S_H
+            pinv_SnH_SH = torch.linalg.lstsq(torch.tensor(S_nH, dtype=dtype, device=device),
+                                             torch.tensor(S_H, dtype=dtype, device=device),
+                                             rcond=rcond).solution
+            # compute I - pinv(S_nH)S_nH
+            I_minus_pinv_SnH_SnH = torch.eye(len(non_measured_indices), dtype=dtype, device=device) - \
+                                   torch.linalg.lstsq(torch.tensor(S_nH, dtype=dtype, device=device),
+                                                     torch.tensor(S_nH, dtype=dtype, device=device),
+                                                     rcond=rcond).solution
+            # Compute indicator matrix for measured indices
+            H_indicator = torch.zeros((len(measured_indices), S.shape[1]), dtype=dtype, device=device)
+            for i, j in enumerate(measured_indices):
+                H_indicator[i, j] = 1
+
+            # interlace columns and rows of all
+            projection_matrix = torch.zeros((S.shape[1], S.shape[1]), dtype=dtype, device=device)
+            projection_matrix[non_measured_indices, non_measured_indices] = I_minus_pinv_SnH_SnH
+            projection_matrix[non_measured_indices, measured_indices] = pinv_SnH_SH
+            projection_matrix[measured_indices, :] = H_indicator
+            self.register_buffer('projection_matrix', projection_matrix, persistent=True)
+            self.name = "FBAproFixed"
+            return
+
         # agreement with any initial vector given later, v, as v + span(e_i for i not in measured_indices)
         B = torch.zeros(self.A.shape[0], self.A.shape[0] - len(measured_indices), dtype=dtype,
                         device=device)
@@ -95,6 +128,8 @@ class FBApro(nn.Module):
         for i, j in enumerate(unmeasured_indices):
             B[j, i] = 1
         self.register_buffer('B', B, persistent=True)
+
+        # Split
 
         # Now construct D = AA^T + BB^T
         # BB^T is the dot products of rows of B. Each row can have at most 1 and the rest 0s, and two different rows
@@ -144,16 +179,6 @@ class FBApro(nn.Module):
 
         DDpinv = torch.matmul(self.D, self.D_pseudoinv)
         self.register_buffer('DDpinv', DDpinv, persistent=True)
-
-        if len(unknown_indices) == 0:
-            # this is only a steady-state projection with fixed values at measured indices
-            # Now the final projection matrix is CCpinv(I - AAtDpinv) + AAtDpinv
-            projection_matrix = self.C @ torch.linalg.lstsq(C, (torch.eye(
-                self.C.shape[0], dtype=dtype, device=device) - AAtDpinv), rcond=rcond,
-                                                            driver=driver).solution + AAtDpinv
-            self.register_buffer('projection_matrix', projection_matrix, persistent=True)
-            self.name = "FBAproFixed"
-            return
 
         # The first projection - to the restricted intersection space
         # v -> P(AA^TD^+ + PC(PC)^+[P - PAA^TD^+])v.
