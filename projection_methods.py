@@ -7,12 +7,10 @@ from troppo.methods.reconstruction import imat, gimme, fastcore
 import pandas as pd
 import cobra
 
-
-
 class FBApro(nn.Module):
     def __init__(self, stoichiometric_matrix, measured_indices=None, unknown_indices=None,
-                 steady_state_basis_matrix=None, acond=1e-5, device=torch.device('cuda'), rcond=1e-5, driver=None,
-                 dtype=torch.float, **kwargs):
+                 steady_state_basis_matrix=None, acond=0, rcond=1e-3, device=torch.device('cuda'), driver=None,
+                 dtype=torch.float64, **kwargs):
 
         if driver is None:
             if device.type == 'cuda':
@@ -23,18 +21,13 @@ class FBApro(nn.Module):
 
         super().__init__()
 
+
+
         self.have_warned_intersection = False
         self.have_warned_projection = False
 
         # The projection returns, for an input, a closest steady-state vector that agrees with it on measured_indices,
         # where distances are computed only on indices not in unknown_indices.
-        # First, we express both the steady-state space (kernel of stoichiometric_matrix) and the measured_indices
-        # agreement space as affine spaces with spanning bases.
-        # Note that the initial vector will only be known during forward pass, but measured indices will be known
-        # beforehand, so that a lot can be precomputed.
-        # A mapping to the non-unmeasured indices is also computed. The full projection then consistes of first
-        # restriction-mapping to the not unknown-indices, a projection to the intersection of the two spaces there,
-        # and then an inverse map.
         # When computing some auxiliary matrices, acond is absolute conditioning, such that values with smaller
         # absolute values are zerod.
         if measured_indices is None:
@@ -45,10 +38,20 @@ class FBApro(nn.Module):
         # assert no intersection between measured and unknown indices
         assert set(measured_indices).isdisjoint(set(unknown_indices))
 
+        # check if any of the index lists is out of order, and order it if so
+        if measured_indices != sorted(measured_indices):
+            print("Warning: measured indices not in order, sorting them.")
+            measured_indices = sorted(measured_indices)
+        if unknown_indices != sorted(unknown_indices):
+            print("Warning: unknown indices not in order, sorting them.")
+            unknown_indices = sorted(unknown_indices)
 
-        # steady-state as ker(A)
+        if type(stoichiometric_matrix) != torch.Tensor:
+            stoichiometric_matrix = torch.tensor(stoichiometric_matrix, dtype=dtype, device=device)
+
+        # Get orthonormal basis for steady-state space
         if steady_state_basis_matrix is None:
-            steady_state_basis_matrix = scipy.linalg.null_space(stoichiometric_matrix)
+            steady_state_basis_matrix = scipy.linalg.null_space(stoichiometric_matrix.cpu().numpy(), rcond=rcond)
         if type(steady_state_basis_matrix) != torch.Tensor:
             steady_state_basis_matrix = torch.tensor(steady_state_basis_matrix, dtype=dtype,
                                                      device=device)
@@ -57,89 +60,63 @@ class FBApro(nn.Module):
         assert stoichiometric_matrix.shape[1] == steady_state_basis_matrix.shape[0]
         self.register_buffer('stoic', torch.tensor(stoichiometric_matrix, device=device, dtype=dtype),
                              persistent=True)
-        self.register_buffer('A', steady_state_basis_matrix, persistent=True)
+        A = steady_state_basis_matrix
 
         if len(measured_indices) == 0 and len(unknown_indices) == 0:
-            # Simply a projection to the steady-state space
+            # Simply a projection to the steady-state space, since it's span(A) and A is orthogonal,
+            # the projection is AA^T
             self.register_buffer('projection_matrix',
-                                 self.A @ torch.linalg.pinv(self.A, rcond=rcond), persistent=True)
+                                 A @ torch.transpose(A, 0, 1), persistent=True)
             self.name = "FBAproBasic"
             return
 
-        restriction_matrix = torch.zeros(stoichiometric_matrix.shape[1] - len(unknown_indices),
-                                         stoichiometric_matrix.shape[1],
-                                         dtype=dtype, device=device)
-        j = 0
-        for i in range(stoichiometric_matrix.shape[1] - len(unknown_indices)):
-            while j in unknown_indices:
+        if len(unknown_indices) > 0:
+            # define a restriction to the indices complement set:
+            restriction_matrix = torch.zeros(stoichiometric_matrix.shape[1] - len(unknown_indices) - len(measured_indices),
+                                             stoichiometric_matrix.shape[1],
+                                             dtype=dtype, device=device)
+            j = 0
+            for i in range(stoichiometric_matrix.shape[1] - len(unknown_indices) - len(measured_indices)):
+                while j in unknown_indices or j in measured_indices:
+                    j += 1
+                restriction_matrix[i, j] = 1
                 j += 1
-            restriction_matrix[i, j] = 1
-            j += 1
-        P = restriction_matrix
-        self.register_buffer('P', restriction_matrix, persistent=True)
+            P = restriction_matrix
 
         if len(measured_indices) == 0:
-            # This is only a steady-state projection ignoring some indices using a restriction.
-            PA = torch.matmul(self.P, self.A)
-            self.register_buffer('PA', PA, persistent=True)
-            pinv_PA_P = torch.linalg.pinv(PA, rcond=rcond) @ P
-            projection_matrix = torch.matmul(self.A, pinv_PA_P)
+            # This is a steady-state projection ignoring some indices using a restriction.
+            # Compute A @ (PA)^+ @ P
+
+            # only compute A @ A0^T, where A0 only has the rows of A corresponding to non-unknown indices
+            # PA_pinv = torch.linalg.pinv(P @ self.A, rtol=rcond)
+            # projection_matrix = self.A @ PA_pinv @ P
+            PA_pinv_P = torch.linalg.lstsq(P @ A, P, rcond=rcond)[0]
+            projection_matrix = A @ PA_pinv_P
             self.register_buffer('projection_matrix', projection_matrix, persistent=True)
+
             self.name = "FBAproPartial"
             return
 
-        if len(unknown_indices) == 0:
-            # There's a more efficient and probably stable implementation for this case, using the ker(S) representation
-            # Separate the indices to measured and otherwise, and separate the columns of S to these as
-            # S_H and S_nH. Then compute I-pinv(S_nH)S_nH and pinv(S_nH)S_Hm, first of size (|nH|,  |nH|) and
-            # second of size (|nH|, |H|). Then interlace their columns back to a matrix of size (|nH|, r). Then
-            # interlace the rows of this with row indicators for |H| (size (|H|, r)) to get the projection matrix.
-            S = stoichiometric_matrix
-            non_measured_indices = [i for i in range(self.S.shape[1]) if i not in measured_indices]
-            S_H = S[:, measured_indices]
-            S_nH = S[:, non_measured_indices]
-            # compute pinv(S_nH)S_H
-            pinv_SnH_SH = torch.linalg.lstsq(torch.tensor(S_nH, dtype=dtype, device=device),
-                                             torch.tensor(S_H, dtype=dtype, device=device),
-                                             rcond=rcond).solution
-            # compute I - pinv(S_nH)S_nH
-            I_minus_pinv_SnH_SnH = torch.eye(len(non_measured_indices), dtype=dtype, device=device) - \
-                                   torch.linalg.lstsq(torch.tensor(S_nH, dtype=dtype, device=device),
-                                                     torch.tensor(S_nH, dtype=dtype, device=device),
-                                                     rcond=rcond).solution
-            # Compute indicator matrix for measured indices
-            H_indicator = torch.zeros((len(measured_indices), S.shape[1]), dtype=dtype, device=device)
-            for i, j in enumerate(measured_indices):
-                H_indicator[i, j] = 1
+        # Fixing a subset of reactions, with or without ignored indices, is first expressed as a projection
+        # to the intersection of two affine spaces, the steady-state and unfixed-degrees-of-freedom space.
 
-            # interlace columns and rows of all
-            projection_matrix = torch.zeros((S.shape[1], S.shape[1]), dtype=dtype, device=device)
-            projection_matrix[non_measured_indices, non_measured_indices] = I_minus_pinv_SnH_SnH
-            projection_matrix[non_measured_indices, measured_indices] = pinv_SnH_SH
-            projection_matrix[measured_indices, :] = H_indicator
-            self.register_buffer('projection_matrix', projection_matrix, persistent=True)
-            self.name = "FBAproFixed"
-            return
-
-        # agreement with any initial vector given later, v, as v + span(e_i for i not in measured_indices)
-        B = torch.zeros(self.A.shape[0], self.A.shape[0] - len(measured_indices), dtype=dtype,
+        # degrees of freedom - span{e_i, i not in measured_indices}
+        B = torch.zeros(A.shape[0], A.shape[0] - len(measured_indices), dtype=dtype,
                         device=device)
-        unmeasured_indices = [i for i in range(self.A.shape[0]) if i not in measured_indices]
+        unmeasured_indices = [i for i in range(A.shape[0]) if i not in measured_indices]
         for i, j in enumerate(unmeasured_indices):
             B[j, i] = 1
-        self.register_buffer('B', B, persistent=True)
-
-        # Split
 
         # Now construct D = AA^T + BB^T
         # BB^T is the dot products of rows of B. Each row can have at most 1 and the rest 0s, and two different rows
         # can't have 1 in the same index. BB^T is then a diagonal matrix with 1s at non-high confidence indices.
         BBT = torch.diag(
-            torch.tensor([int(i not in measured_indices) for i in range(self.A.shape[0])], dtype=dtype,
+            torch.tensor([int(i not in measured_indices) for i in range(A.shape[0])], dtype=dtype,
                          device=device))
         # D = torch.matmul(self.A, torch.transpose(self.A, 1, 0)) + torch.matmul(self.B, torch.transpose(self.B, 1, 0))
-        D = torch.matmul(self.A, torch.transpose(self.A, 1, 0)) + BBT
-        self.register_buffer('D', D, persistent=True)
+        D = torch.matmul(A, torch.transpose(A,1, 0)) + BBT
+        del BBT
+        # self.D = D
         # Compute pseudo-inverse for D
         # print fraction of nan/inf values in D
         d_inf_frac = np.count_nonzero(~np.isfinite(D.cpu().numpy())) / (D.shape[0] * D.shape[1])
@@ -150,54 +127,82 @@ class FBApro(nn.Module):
         # I was getting too many "svd did not converge" errors, not sure what conditions lead to this, it's not very predictable. Seems like using lstsq instead of pinv I'm not getting these errors.
         # print("D mean|.|:", abs(D.cpu()).mean().mean())
         # print("D min|.|, max|.|:", abs(D.cpu()).min().min(), abs(D.cpu()).max().max())
-        D_pseudoinv = torch.linalg.lstsq(D, torch.eye(*D.shape, dtype=dtype, device=device), rcond=rcond).solution.to(
-            device).to(dtype)
-        # D_pseudoinv = torch.linalg.pinv(D, rtol=rcond).to(device).to(dtype)
+        # D_pseudoinv = torch.linalg.lstsq(D, torch.eye(*D.shape, dtype=dtype, device=device), rcond=rcond)[0].to(
+        #     device).to(dtype)
+        D_pseudoinv = torch.linalg.pinv(D, rtol=rcond, hermitian=True).to(device).to(dtype)
+        del D
 
         # D_pseudoinv = torch.tensor(scipy.linalg.pinv(D.cpu(), atol=acond, rtol=rcond), device=device, dtype=dtype)
-        self.register_buffer('D_pseudoinv', D_pseudoinv, persistent=True)
+        # self.D_pseudoinv = D_pseudoinv
 
         # Projection is then to the space c + col(C), where c = AA^TD+b and C=[BB^TD+A:AA^TD+B]
-        C = torch.cat((self.B @ torch.transpose(self.B, 1, 0) @ D_pseudoinv @ self.A,
-                       self.A @ torch.transpose(self.A, 1, 0) @ D_pseudoinv @ self.B), dim=1)
-        # C = torch.cat((self.B @ torch.transpose(self.B, 1, 0) @
-        #                torch.linalg.lstsq(D, self.A, rcond=rcond, driver=driver).solution,
-        #               self.A @ torch.transpose(self.A, 1, 0) @
-        #                torch.linalg.lstsq(D, self.B, rcond=rcond, driver=driver).solution), dim=1)
-        assert C.shape == (self.B.shape[0], self.A.shape[1] + self.B.shape[1])
-        assert self.B.shape[0] == self.A.shape[0]
-        # condition C by replacing values with absolute value smaller than acond with 0
+        C = torch.cat((B @ torch.transpose(B, 1, 0) @ D_pseudoinv @ A,
+                       A @ torch.transpose(A, 1, 0) @ D_pseudoinv @ B), dim=1)
+        C_shape = C.shape
         C[torch.abs(C) < acond] = 0
 
-        self.register_buffer('C', C, persistent=True)
+        AAtDpinv = A @ torch.transpose(A, 0, 1) @ D_pseudoinv
 
-        # Cpinv = torch.linalg.pinv(self.C)
-        # self.register_buffer('Cpinv', Cpinv, persistent=True)
+        del D_pseudoinv
 
-        AAtDpinv = self.A @ torch.transpose(self.A, 0, 1) @ self.D_pseudoinv
-        self.register_buffer("AAtDpinv", AAtDpinv, persistent=True)
+        if len(unknown_indices) > 0:
+            restriction_matrix = torch.zeros((stoichiometric_matrix.shape[1] - len(unknown_indices),
+                                                 stoichiometric_matrix.shape[1]), dtype=dtype, device=device)
+            j = 0
+            for i in range(stoichiometric_matrix.shape[1] - len(unknown_indices)):
+                while j in unknown_indices:
+                    j += 1
+                restriction_matrix[i, j] = 1
+                j += 1
+            P = restriction_matrix
 
-        DDpinv = torch.matmul(self.D, self.D_pseudoinv)
-        self.register_buffer('DDpinv', DDpinv, persistent=True)
+            # The first projection - to the restricted intersection space
+            # v -> P(AA^TD^+ + PC(PC)^+[P - PAA^TD^+])v.
+            # Define T = PAA^TD^+ + PC(PC)^+[I - PAA^TD^+])
+            # PAAtDpinv = P @ AAtDpinv
 
-        # The first projection - to the restricted intersection space
-        # v -> P(AA^TD^+ + PC(PC)^+[P - PAA^TD^+])v.
-        # Define T = PAA^TD^+ + PC(PC)^+[I - PAA^TD^+])
-        PAAtDpinv = self.P @ AAtDpinv
-        # print sizes of P, C, PAAtDpinv
-        print("P shape: {}, C shape: {}, PAAtDpinv shape: {}, A shape: {}, Dpinv shape: {}".format(self.P.shape, self.C.shape,
-                                                                     PAAtDpinv.shape, self.A.shape, self.D_pseudoinv.shape))
-        PCPCpinv_minus = self.P @ self.C @ torch.linalg.lstsq(
-            self.P @ self.C, self.P - PAAtDpinv, rcond=rcond, driver=driver).solution
-        self.register_buffer('T', PAAtDpinv + PCPCpinv_minus, persistent=True)
+            # PCPCpinv_minus = P @ self.C @ torch.linalg.lstsq(
+            #     P @ self.C, P - PAAtDpinv).solution
+            # self.T = PAAtDpinv + PCPCpinv_minus
+            #
+            # projection_matrix = AAtDpinv + self.C @ torch.linalg.lstsq(
+            #     P @ self.C, self.T - PAAtDpinv).solution
 
-        # We're now looking for x such that P(AA^TD^+v + Cx) = Tv
-        # Solving for this yields x = (PC)^+(y - PAA^TD^+v), and so finally the projection matrix is
-        # AA^TD^+ + C(PC)^+(T - PAA^TD^+)
-        projection_matrix = AAtDpinv + self.C @ torch.linalg.lstsq(
-            self.P @ self.C, self.T - PAAtDpinv, rcond=rcond, driver=driver).solution
+
+            # E = self.C @ torch.linalg.pinv(P @ self.C, atol=acond, rtol=rcond)
+            # EP = E @ P
+            #
+            # projection_matrix = EP + (torch.eye(self.C.shape[0], dtype=dtype, device=device) - EP) @ AAtDpinv
+
+            # E = self.C @ torch.linalg.pinv(P @ self.C, atol=acond, rtol=rcond)
+            E = C @ torch.linalg.lstsq(P @ C, P, rcond=rcond)[0]
+            del C
+            projection_matrix = E + (torch.eye(C_shape[0], dtype=dtype, device=device) - E) @ AAtDpinv
+
+            # restricted_projection_matrix = EP + (torch.eye(self.C.shape[0], dtype=dtype, device=device) - EP) @ AAtDpinv
+            # # We computed L such that L (Pv) = Py, for the y we're seeking. Then y is (P^+ * L * P)v, but
+            # # P is orthogonal, so P^+ can be replaced with P^T.
+            # projection_matrix = restricted_projection_matrix @ P
+            #
+
+            self.register_buffer('projection_matrix', projection_matrix, persistent=True)
+
+            self.name = "FBAproFull"
+            return
+
+        # projection_matrix = self.C @ torch.linalg.lstsq(C, (torch.eye(
+        #     self.C.shape[0], dtype=dtype, device=device) - AAtDpinv))[0] + AAtDpinv
+        # projection_matrix = AAtDpinv + C @ torch.linalg.pinv(C, rtol=rcond) @ (torch.eye(
+        #     C.shape[0], dtype=dtype, device=device) - AAtDpinv)
+
+                
+        E = torch.linalg.lstsq(C, (torch.eye(C.shape[0], dtype=dtype, device=device) - AAtDpinv), rcond=rcond)[0].to(device=device)
+        Q = C @ E
+        del C
+        del E
+        projection_matrix = AAtDpinv + Q
         self.register_buffer('projection_matrix', projection_matrix, persistent=True)
-        self.name = "FBAproFull"
+        self.name = "FBAproFixed"
 
     def forward(self, x, l_bounds=None, u_bounds=None):
         # x is samples X reactions, transpose for operations here
@@ -228,14 +233,7 @@ class FBApro(nn.Module):
                                                                                            mul.abs().mean()))
             print("Suppressing further intersection warnings.")
             self.have_warned_intersection = True
-        # assert torch.allclose(x, self.DDpinv @ x)
 
-        # print("A\n", self.A)
-        # print("SA\n", self.stoic @ self.A)
-        # print("B\n", self.B)
-        # print("C\n", self.C)
-        # print("D\n", self.D)
-        # print("Projection\n", self.projection_matrix)
         res = self.projection_matrix @ x
 
         if not self.have_warned_projection and not torch.allclose(self.stoic @ res,
@@ -245,6 +243,10 @@ class FBApro(nn.Module):
             print("Warning: projection failed to project to steady state. Accepting, but here are magnitudes:")
             # print(res, "")
             # print absolute values, min, max, and mean
+
+            print("Input - abs min: {:.2e}, abs max: {:.2e}, abs mean: {:.2e}".format(x.abs().min(), x.abs().max(),
+                                                                                      x.abs().mean()))
+
             print("output - abs min: {:.2e}, abs max: {:.2e}, abs mean: {:.2e}".format(res.abs().min(), res.abs().max(),
                                                                                        res.abs().mean()))
 
@@ -270,7 +272,7 @@ class FBApro(nn.Module):
 
 class SoftClip(nn.Module):
     # see https://ccrma.stanford.edu/~jos/pasp/Soft_Clipping.html
-    def __init__(self, l_bounds, u_bounds, device=torch.device('cuda'), dtype=torch.float, slope=0.01,
+    def __init__(self, l_bounds, u_bounds, device=torch.device('cuda'), dtype=torch.float64, slope=0.01,
                  input_mix_fraction=0.8):
         super().__init__()
         if type(l_bounds) != torch.Tensor:
@@ -341,7 +343,7 @@ class SoftClip(nn.Module):
 
 class BoundScale(nn.Module):
     # see https://ccrma.stanford.edu/~jos/pasp/Soft_Clipping.html
-    def __init__(self, l_bounds, u_bounds, device=torch.device('cuda'), dtype=torch.float, zero_sign_mismatches=True,
+    def __init__(self, l_bounds, u_bounds, device=torch.device('cuda'), dtype=torch.float64, zero_sign_mismatches=True,
                  input_mix_fraction=0.8):
         super().__init__()
         if type(l_bounds) != torch.Tensor:
@@ -413,8 +415,8 @@ class BoundScale(nn.Module):
         return self.__repr__()
 
 class IterativeProjectionClip(nn.Module):
-    def __init__(self, projection_class, n_iters, l_bounds, u_bounds, dtype=torch.float, device=torch.device('cuda'),
-                 slope=0.01, input_mix_fraction=0.5, *params, **kwargs):
+    def __init__(self, projection_class, n_iters, l_bounds, u_bounds, dtype=torch.float64, device=torch.device('cuda'),
+                 slope=0.01, input_mix_fraction=0.5, projection_as_last=True, *params, **kwargs):
         super().__init__()
         assert l_bounds is not None
         assert u_bounds is not None
@@ -423,7 +425,10 @@ class IterativeProjectionClip(nn.Module):
                                                *params, **kwargs)
         clip = SoftClip(l_bounds, u_bounds, device=device, dtype=dtype,
                         slope=slope, input_mix_fraction=input_mix_fraction)
-        sequence = [projection_instance] + [clip, projection_instance] * n_iters
+        if projection_as_last:
+            sequence = [projection_instance] + [clip, projection_instance] * n_iters
+        else:
+            sequence = [projection_instance] + [clip, projection_instance] * n_iters + [clip]
         self.steps = nn.Sequential(*sequence)
         self.projection_class = projection_class
 
@@ -437,8 +442,8 @@ class IterativeProjectionClip(nn.Module):
         return self.__repr__()
 
 class IterativeProjectionScale(nn.Module):
-    def __init__(self, projection_class, n_iters, l_bounds, u_bounds, dtype=torch.float, device=torch.device('cuda'),
-                 zero_sign_mismatches=True, input_mix_fraction=0.8, *params, **kwargs):
+    def __init__(self, projection_class, n_iters, l_bounds, u_bounds, dtype=torch.float64, device=torch.device('cuda'),
+                 zero_sign_mismatches=True, input_mix_fraction=0.8, projection_as_last=True, *params, **kwargs):
         super().__init__()
         sequence = []
         assert l_bounds is not None
@@ -448,7 +453,10 @@ class IterativeProjectionScale(nn.Module):
                                                *params, **kwargs)
         scale = BoundScale(l_bounds, u_bounds, device=device, dtype=dtype,
                            zero_sign_mismatches=zero_sign_mismatches, input_mix_fraction=input_mix_fraction)
-        sequence = [projection_instance] + [scale, projection_instance] * n_iters
+        if projection_as_last:
+            sequence = [projection_instance] + [scale, projection_instance] * n_iters
+        else:
+            sequence = [projection_instance] + [scale, projection_instance] * n_iters + [scale]
         self.steps = nn.Sequential(*sequence)
         self.projection_class = projection_class
 
@@ -463,7 +471,7 @@ class IterativeProjectionScale(nn.Module):
 
 
 class FBAWrapper(object):
-    def __init__(self, model, dtype=torch.float, **kwargs):
+    def __init__(self, model, dtype=torch.float64, **kwargs):
         self.model = model
         self.dtype = dtype
 
@@ -502,7 +510,7 @@ class RawInputWrapper(nn.Module):
         return self.__repr__()
 
 class MoMAWrapper(object):
-    def __init__(self, model, objective_id, dtype=torch.float, device=torch.device("cpu"), **kwargs):
+    def __init__(self, model, objective_id, dtype=torch.float64, device=torch.device("cpu"), **kwargs):
         self.model = model
         self.dtype = dtype
         self.device = device

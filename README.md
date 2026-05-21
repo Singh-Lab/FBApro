@@ -1,7 +1,7 @@
 # FBApro
 A linear-transformation based framework for integrating data with constraint based metabolic models. 
 Implemented in Python as pytorch.nn.Module subclasses.
-Includes three main methods: FBAprojection, FBAprojectionLowMid (aka FBAproPartial), FBAprojectionHighMid (akaFBAproFIxed).
+All methods implemented in one class, with name generated depending on special cases of input values: FBAproFull, FBAproPartial, FBAproFixed, FBAproBasic.
 
 # Usage snippet
 
@@ -14,8 +14,10 @@ model = SOME_MODEL_FILE
 % a samplex X reactions (numpy array / torch tensor)
 
 data = SOME_DATA_MATRIX 
+unknown_indices = LIST_OF_REACTION_INDICES
+measured_indices = DISJOINT_LIST_OF_REACTION_INDICES
 
-projection = FBAprojection(model)
+projection = FBAprojection(model, measured_indices=measured_indices, unknown_indices=unknown_indices)
 
 % samples X reactions, each row is the closest row in ker(S) to the corresponding row of data.
 
@@ -25,7 +27,9 @@ steadied_states = projection.forward(data)
 
 # Real and simulated data reproduction
 ## Synthetic data
-synthetic_exact_noisy_data.ipynb, synthetic_noisy_missing_data.ipynb, synthetic_projections_timing.ipynb generate synthetic steady-state fluxes from given metabolic models, and analyze the runtime and performance of FBApro variants and benchmarks on them. To recreate paper figures, models need to be sourced and placed in synthetic_data_experiment_files/data (see instructions there).
+synthetic_data_basis.ipynb, synthetic_data_cobrapy.ipynb, synthetic_data_randomfba.ipynb all generate synthetic steady-state fluxes from given metabolic models, and analyze the runtime and performance of FBApro variants and benchmarks on them, with different data generation methods. To recreate paper figures, models need to be sourced and placed in synthetic_data_experiment_files/data (see instructions there).
 
 ## Real data
-real_data_run.ipynb runs FBApro variants and benchmark on a given model, GE data and flux data and outputs predictions. real_data_plot.ipynb reads predictions and cached processed data and plots performance of methods. To recreate paper figures, data need to be sourced and placed in real_data_experiment_files/data (see instructions there).
+real_data_run.ipynb runs FBApro variants and benchmark on a given model, GE data and flux data and outputs predictions. real_data_plot.ipynb reads predictions and cached processed data and plots performance of methods. To recreate paper figures, data need to be sourced and placed in real_data_experiment_files/data (see instructions there). 
+
+paper_figures.ipynb generates figures separately using cached outputs from both synthetic and real data experiments used in the analysis described in the paper.
